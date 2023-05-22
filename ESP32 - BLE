@@ -1,0 +1,75 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <ESP32Servo.h>
+
+int scanTime = 5; // Segundos
+BLEScan* pBLEScan;
+
+const int pirPin = 5;
+const int servoPin = 21;
+
+Servo servo;
+
+bool deviceFound = false;
+
+bool isDeviceAuthorized(BLEAdvertisedDevice advertisedDevice) {
+  if (advertisedDevice.getName() == "NomeDespositivo") { // Colocar nome do Despositivo
+    return true;
+  }
+  return false;
+}
+
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) {
+      Serial.printf("Advertised Device: %s \n", advertisedDevice.toString().c_str());
+      
+      if (isDeviceAuthorized(advertisedDevice)) {
+        deviceFound = true;
+        activatePIRAndServo();
+      }
+    }
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Scanning...");
+
+  // Inicializa o BLE
+  BLEDevice::init("");
+  pBLEScan = BLEDevice::getScan(); 
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setActiveScan(true); 
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);  
+  pinMode(pirPin, INPUT); 
+  servo.attach(servoPin); 
+}
+
+void loop() {
+  // Executa o scan BLE
+  BLEScanResults foundDevices = pBLEScan->start(scanTime, false);
+  Serial.print("Devices found: ");
+  Serial.println(foundDevices.getCount());
+  Serial.println("Scan done!");
+
+  // Verifica se um dispositivo autorizado foi encontrado
+  if (!deviceFound) {
+    Serial.println("No authorized device found.");
+  }
+
+  pBLEScan->clearResults();
+
+  delay(2000);
+}
+
+void activatePIRAndServo() {
+  Serial.println("Device authorized. Activating PIR and servo motor.");
+
+  if (digitalRead(pirPin) == HIGH) {
+    servo.write(110);
+    delay(4000);
+    servo.write(0);
+  }
+}
