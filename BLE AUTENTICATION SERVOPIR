@@ -1,0 +1,90 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+#include <BLEAdvertisedDevice.h>
+#include <BluetoothSerial.h>
+#include <ESP32Servo.h>
+
+// Pinos do Sensor PIR e do Servo Motor
+const int PIR_PIN = 5;
+const int SERVO_PIN = 21;
+
+// UUID do serviço Bluetooth
+#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+// UUID da característica para receber notificações
+#define CHARACTERISTIC_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+// Endereço MAC do dispositivo autorizado
+#define AUTHORIZED_DEVICE_MAC  "12:CC:8A:CC:C1:8A"
+
+BLEServer *pServer;
+BLEService *pService;
+BLECharacteristic *pCharacteristic;
+bool authorizedDeviceConnected = false;
+
+Servo servo;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+
+    if (AUTHORIZED_DEVICE_MAC){
+      authorizedDeviceConnected = true;
+      Serial.println("Authorized device connected!");
+    } else {
+      authorizedDeviceConnected = false;
+      pServer->disconnect(pServer->getConnId());
+      Serial.println("Unauthorized device connected! Disconnecting...");
+    }
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->start();
+    Serial.println("Device disconnected!");
+    authorizedDeviceConnected = false;
+    Serial.println("Stop Detection");
+  }
+};
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(PIR_PIN, INPUT);
+  servo.attach(SERVO_PIN);
+
+  BLEDevice::init("ESP32");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  pService = pServer->createService(BLEUUID(SERVICE_UUID));
+  pCharacteristic = pService->createCharacteristic(
+      BLEUUID(CHARACTERISTIC_UUID),
+      BLECharacteristic::PROPERTY_READ |
+      BLECharacteristic::PROPERTY_NOTIFY
+  );
+
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+
+  BLEAdvertising *pAdvertising = pServer->getAdvertising();
+  pAdvertising->addServiceUUID(BLEUUID(SERVICE_UUID));
+  pAdvertising->setScanResponse(false);
+  pAdvertising->setMinPreferred(0x0);
+  pAdvertising->start();
+
+  Serial.println("Setup completed!");
+}
+
+void loop() {
+  if (authorizedDeviceConnected) {
+    Serial.println("Verificando movimento...");
+    if (digitalRead(PIR_PIN) == HIGH) {
+      Serial.println("Movimento detectado!");
+      servo.write(110);
+      delay(3000);
+      servo.write(0);
+      delay(1000);
+    }
+  }
+  delay(2000);
+}
