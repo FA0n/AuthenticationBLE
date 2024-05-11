@@ -1,2 +1,2 @@
 # CoddinFaculdade
-Projetos para meu uso academico
+Projeto de autenticação bluetooth para autorização em dispositivos locked
