@@ -11,11 +11,11 @@ const int PIR_PIN = 5;
 const int SERVO_PIN = 21;
 
 // UUID do serviço Bluetooth
-#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define SERVICE_UUID           "####################################"
 // UUID da característica para receber notificações
-#define CHARACTERISTIC_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define CHARACTERISTIC_UUID    "####################################"
 // Endereço MAC do dispositivo autorizado
-#define AUTHORIZED_DEVICE_MAC  "12:CC:8A:CC:C1:8A"
+#define AUTHORIZED_DEVICE_MAC  "################"
 
 BLEServer *pServer;
 BLEService *pService;
