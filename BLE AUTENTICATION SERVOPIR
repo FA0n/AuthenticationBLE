@@ -1,90 +1,205 @@
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEServer.h>
-#include <BLE2902.h>
-#include <BLEAdvertisedDevice.h>
-#include <BluetoothSerial.h>
+#include <Wire.h>
 #include <ESP32Servo.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <algorithm>
+#include "esp_wifi.h"
+#include "esp_bt.h"
 
-// Pinos do Sensor PIR e do Servo Motor
-const int PIR_PIN = 5;
-const int SERVO_PIN = 21;
+#define SCAN_INTERVAL 1000
+#define MAX_MISSING_TIME 5000
 
-// UUID do serviço Bluetooth
-#define SERVICE_UUID           "####################################"
-// UUID da característica para receber notificações
-#define CHARACTERISTIC_UUID    "####################################"
-// Endereço MAC do dispositivo autorizado
-#define AUTHORIZED_DEVICE_MAC  "################"
+char DEVICEID[] = "a8a1d483-96bc-4444-8acb-9d01fa7cfc44";
 
-BLEServer *pServer;
-BLEService *pService;
-BLECharacteristic *pCharacteristic;
-bool authorizedDeviceConnected = false;
+int scanTime = 2;
+BLEScan* pBLEScan;
+uint32_t lastScanTime = 1000;
+boolean found = false;
+uint32_t lastFoundTime = 0;
+int rssi = -100;
+boolean RSSI_Range = false;
+
+unsigned long lastSeenTime = 0;
+unsigned long lastCloseTime = 0;
+const unsigned long LOST_TIMEOUT      = 2100;   // perdeu sinal BLE
+const unsigned long OPEN_COOLDOWN    = 1500;   // tempo mínimo entre aberturas
+const unsigned long PIR_TRIGGER_CD   = 3000;   // cooldown do PIR depois de acionar
+const unsigned long AUTO_CLOSE_TIME  = 3500;   // fecha depois de 2.5s aberto
 
 Servo servo;
 
-class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) {
+const int PIR_PIN   = 5;
+const int SERVO_PIN = 21;
+const int LED_PIN   = 2;
 
-    if (AUTHORIZED_DEVICE_MAC){
-      authorizedDeviceConnected = true;
-      Serial.println("Authorized device connected!");
-    } else {
-      authorizedDeviceConnected = false;
-      pServer->disconnect(pServer->getConnId());
-      Serial.println("Unauthorized device connected! Disconnecting...");
-    }
+bool servoOpen = false;
+float rssiFiltered = -100;
+int consecutiveHits = 0;
+
+// Controle de tempo de eventos
+unsigned long lastPirTriggerTime = 0;   // última vez que o PIR abriu a trava
+unsigned long servoOpenTime      = 0;   // quando o servo foi aberto
+
+// ==== BLE ====
+float txPower = -70;
+float RSSI_OPEN_THRESHOLD  = -70;
+float RSSI_CLOSE_THRESHOLD = -73;
+float distance = 0.0;
+
+// ==== Utilidades ====
+String toHexLower(const std::string &data) {
+  static const char hexchars[] = "0123456789abcdef";
+  String out = "";
+  out.reserve(data.size() * 2);
+  for (unsigned char c : data) {
+    out += hexchars[(c >> 4) & 0x0F];
+    out += hexchars[c & 0x0F];
   }
+  return out;
+}
 
-  void onDisconnect(BLEServer* pServer) {
-    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->start();
-    Serial.println("Device disconnected!");
-    authorizedDeviceConnected = false;
-    Serial.println("Stop Detection");
+String normalizeUUID(const char* uuidWithDashes) {
+  String s = String(uuidWithDashes);
+  s.replace("-", "");
+  s.toLowerCase();
+  return s;
+}
+
+// ==== Callback BLE ====
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    std::string mfg = advertisedDevice.getManufacturerData();
+    if (!mfg.empty()) {
+      String mfgHex = toHexLower(mfg);
+      String target = normalizeUUID(DEVICEID);
+
+      if (mfgHex.indexOf(target) != -1) {
+        int newRSSI = advertisedDevice.getRSSI();
+        rssi = newRSSI;
+
+        if (rssiFiltered == -100) {
+          rssiFiltered = newRSSI;
+        } else {
+          rssiFiltered = (0.3 * newRSSI) + (0.7 * rssiFiltered);
+        }
+
+        distance = pow(10, (txPower - rssiFiltered) / 20.0);
+
+        Serial.print("RSSI Bruto: ");
+        Serial.print(newRSSI);
+        Serial.print(" | Filtrado: ");
+        Serial.println(rssiFiltered);
+
+        // --- Histerese + leituras estáveis ---
+        if (rssiFiltered > RSSI_OPEN_THRESHOLD) {
+          consecutiveHits++;
+          if (consecutiveHits >= 3) {
+            RSSI_Range = true;
+            consecutiveHits = 0;
+            Serial.println(">> BLE dentro da faixa (RSSI_Range = true)");
+          }
+        } else if (rssiFiltered < RSSI_CLOSE_THRESHOLD) {
+          consecutiveHits++;
+          if (consecutiveHits >= 3) {
+            RSSI_Range = false;
+            consecutiveHits = 0;
+            Serial.println(">> BLE fora da faixa (RSSI_Range = false)");
+          }
+        } else {
+          consecutiveHits = 0;
+        }
+        lastSeenTime = millis();
+      }
+    }
   }
 };
 
+// ==== Setup ====
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
+  Serial.println("Iniciando sistema BLE + PIR (simples com cooldown)");
 
   pinMode(PIR_PIN, INPUT);
+  pinMode(SERVO_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  BLEDevice::init("");
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(200);
+  pBLEScan->setWindow(180);
+
   servo.attach(SERVO_PIN);
+  servo.write(0); // posição fechada
 
-  BLEDevice::init("ESP32");
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-
-  pService = pServer->createService(BLEUUID(SERVICE_UUID));
-  pCharacteristic = pService->createCharacteristic(
-      BLEUUID(CHARACTERISTIC_UUID),
-      BLECharacteristic::PROPERTY_READ |
-      BLECharacteristic::PROPERTY_NOTIFY
-  );
-
-  pCharacteristic->addDescriptor(new BLE2902());
-  pService->start();
-
-  BLEAdvertising *pAdvertising = pServer->getAdvertising();
-  pAdvertising->addServiceUUID(BLEUUID(SERVICE_UUID));
-  pAdvertising->setScanResponse(false);
-  pAdvertising->setMinPreferred(0x0);
-  pAdvertising->start();
-
-  Serial.println("Setup completed!");
+  Serial.println("Sistema iniciado com BLE ativo!");
+  delay(1000); // estabilizar PIR
 }
 
+// ==== Loop ====
 void loop() {
-  if (authorizedDeviceConnected) {
-    Serial.println("Verificando movimento...");
-    if (digitalRead(PIR_PIN) == HIGH) {
-      Serial.println("Movimento detectado!");
-      servo.write(110);
-      delay(3000);
-      servo.write(0);
-      delay(1000);
-    }
+  static unsigned long lastScan = 0;
+
+  // Leitura direta do PIR (sem filtro complexo)
+  int pirVal = digitalRead(PIR_PIN);
+
+  // Executa o scan BLE periódico
+  if (millis() - lastScan > 300) {
+    lastScan = millis();
+    pBLEScan->start(scanTime, false);
+    pBLEScan->clearResults();
   }
-  delay(2000);
+
+  unsigned long now = millis();
+
+  // --- Condições de abertura ---
+  if (RSSI_Range && !servoOpen &&
+      pirVal == HIGH &&
+      (now - lastCloseTime > OPEN_COOLDOWN) &&
+      (now - lastPirTriggerTime > PIR_TRIGGER_CD)) {
+
+    servo.attach(SERVO_PIN);
+    servo.write(110);
+    servoOpen = true;
+    digitalWrite(LED_PIN, HIGH);
+
+    servoOpenTime      = now;
+    lastPirTriggerTime = now;
+
+    Serial.println("✅ Servo aberto (BLE na faixa + PIR HIGH)");
+  }
+
+  // --- Condições de fechamento ---
+  // Fecha se:
+  //  - BLE saiu da faixa, OU
+  //  - passou AUTO_CLOSE_TIME desde a abertura
+  if (servoOpen &&
+      ( !RSSI_Range || (now - servoOpenTime > AUTO_CLOSE_TIME) )) {
+
+    servo.write(0);
+    delay(300); // garante que chegou na posição
+    
+    servoOpen   = false;
+    digitalWrite(LED_PIN, LOW);
+    lastCloseTime = now;
+    
+    if (!RSSI_Range) {
+      Serial.println("❌ Servo fechado (BLE fora da faixa)");
+    } else {
+      Serial.println("⏱️ Servo fechado automaticamente (timeout)");
+    }
+
+    // servo.detach(); // libera o pino do servo
+  }
+
+  // --- Timeout BLE ---
+  if (now - lastSeenTime > LOST_TIMEOUT) {
+    RSSI_Range = false;
+    consecutiveHits = 0;
+  }
+
+  delay(100); // pequena folga ao sistema
 }
